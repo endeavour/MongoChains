@@ -17,6 +17,7 @@ module Migrations =
   | SetMigrationVersionError
   | CouldNotDetermineCurrentMigrationVersion
   | CouldNotGrantEvalPermission
+  | TokenNotSpecified of key:string
 
   type MigrationDocument =
     {
@@ -30,15 +31,23 @@ module Migrations =
   let migrationDocumentId = ObjectId("5b042070982d96d2252ad46f")
   let migrationCollection (mongoDb:MongoDB.Driver.IMongoDatabase) = mongoDb.GetCollection(migrationMetadataCollection)
 
-  let replaceTokens (tokens:seq<string * string>) (javascript:string) =
+  let replaceTokens (tokens:seq<string * string>) (javascript:string) : Result<string, MigrationError>=
     
+    let regex = System.Text.RegularExpressions.Regex("{#(.*)}")
+    let tokensMap = Map.ofSeq tokens
+    let tokensInJs = [| for m in regex.Matches(javascript) -> m.Groups.[1].Value |]
+    
+    trial {
+    do! tokensInJs |> Seq.map (fun key -> if tokensMap.ContainsKey key then ok () else fail (TokenNotSpecified key)) |> Trial.collect |> Trial.lift ignore
+
     let replace = 
       tokens
       |> Seq.map (fun (k,v) -> sprintf "{#%s}" k, v)
       |> Seq.map (fun (k,v) -> fun (str:string) -> str.Replace(k, v))
       |> Seq.fold (>>) id
     
-    replace javascript
+    return replace javascript
+    }
   
   let getMigrationScripts (rootPath:string) =    
     Seq.initInfinite (fun n -> (n, Path.Combine(rootPath, sprintf "%d%cup.js" n Path.DirectorySeparatorChar)))
@@ -80,10 +89,10 @@ module Migrations =
     let runMigration (n:int) (path:string) (tokens:seq<string * string>) =
       asyncTrial {
       printfn "Applying migration %4d: %s" n path
-      let js = File.ReadAllText(path) |> replaceTokens tokens
+      let! js = File.ReadAllText(path) |> replaceTokens tokens
       let! result = runMongoJavascript js
       let! succeeded = if mongoSucceeded result then ok () else fail (RunJavascriptError result)
-      printfn "Seting current version to %d" n
+      printfn "Setting current version to %d" n
       do! setCurrentVersion n
       return succeeded
       }
@@ -100,7 +109,7 @@ module Migrations =
         }
       | _ -> asyncTrial.Return ()
 
-    let applyMigrations (rootPath:string) (tokens:seq<string * string>) (bootstrapBehaviour:BootstrapBehaviour) : AsyncResult<unit,MigrationError> =
+    let applyMigrations (rootPath:string) (tokens:seq<string * string>) (bootstrapBehaviour:BootstrapBehaviour) (targetVersion:Option<int>) : AsyncResult<unit,MigrationError> =
       
       asyncTrial {      
 
@@ -115,6 +124,7 @@ module Migrations =
       
       let migrations =
         getMigrationScripts rootPath
+        |> Seq.filter (fun (n,_) -> match targetVersion with Some targetVersion -> n <= targetVersion | None -> true)
         |> Seq.filter (fun (n,_) -> n > currentVersion)
         |> Seq.map (fun (n,path) -> runMigration n path tokens)
         |> AsyncTrial.sequence
